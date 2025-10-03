@@ -8,9 +8,8 @@ const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || '';
 const DEFAULT_BUCKET = process.env.SUPABASE_BUCKET || '';
 
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ''; // optional shared secret for DB webhook
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const DELETE_ORIGINAL_AFTER_COMPRESS = process.env.DELETE_ORIGINAL_AFTER_COMPRESS === '1';
-
 const RAW_ALLOWED = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -19,7 +18,7 @@ const RAW_ALLOWED = (process.env.ALLOWED_ORIGINS || '')
 export const config = {
   api: {
     bodyParser: {
-      sizeLimit: '50mb', // keep your current limit
+      sizeLimit: '50mb', // keep current limit
     },
   },
 };
@@ -30,7 +29,7 @@ function isOriginAllowed(origin) {
   return RAW_ALLOWED.some(pattern => {
     if (pattern === origin) return true;
     if (pattern.startsWith('*.')) {
-      const suffix = pattern.slice(1); // e.g. ".vercel.app"
+      const suffix = pattern.slice(1);
       return origin.endsWith(suffix);
     }
     return false;
@@ -66,20 +65,16 @@ function getAdminClientOrThrow() {
 }
 
 // ---- Placeholder compression (pass-through) ----
-// Swap this for Ghostscript or a WASM optimizer later.
 async function compressPdfPlaceholder(buffer) {
   console.info('[compress-and-store] Using placeholder compression (pass-through).');
   return buffer;
 }
 
-// ---- Extract record from Supabase webhook payload ----
+// ---- Helper: extract record from webhook payload ----
 function extractRecordFromWebhook(body) {
   if (!body) return null;
-  // Storage webhook
   if (body.record) return body.record;
-  // DB change payload
   if (body.new) return body.new;
-  // Legacy/other shapes
   return null;
 }
 
@@ -98,7 +93,7 @@ export default async function handler(req, res) {
     const record = extractRecordFromWebhook(req.body);
     const isWebhook = !!record;
 
-    // If this is a DB webhook, optionally require a shared secret
+    // Webhook authentication if enabled
     if (isWebhook && WEBHOOK_SECRET) {
       const auth = req.headers.authorization || '';
       const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
@@ -107,8 +102,8 @@ export default async function handler(req, res) {
       }
     }
 
+    // ---------- Webhook mode ----------
     if (isWebhook) {
-      // ---------- Webhook mode ----------
       const bucket = record.bucket_id || DEFAULT_BUCKET;
       const name = record.name;
       const size = (typeof record?.metadata?.size === 'number')
@@ -140,7 +135,7 @@ export default async function handler(req, res) {
       // Compress (placeholder)
       const compressedBuffer = await compressPdfPlaceholder(originalBuffer);
 
-      // Upload to compressed/<name> with upsert (webhooks can fire multiple times)
+      // Upload compressed copy
       const destPath = `compressed/${name}`;
       const { error: upErr } = await supabase.storage.from(bucket).upload(destPath, compressedBuffer, {
         contentType: 'application/pdf',
@@ -156,16 +151,8 @@ export default async function handler(req, res) {
       let deletedOriginal = false;
       if (DELETE_ORIGINAL_AFTER_COMPRESS) {
         const { error: rmErr } = await supabase.storage.from(bucket).remove([name]);
-        if (rmErr) {
-          console.warn(`[compress-and-store] Failed to remove original ${bucket}/${name}:`, rmErr.message);
-        } else {
-          deletedOriginal = true;
-        }
+        if (!rmErr) deletedOriginal = true;
       }
-
-      const originalSize = originalBuffer.length;
-      const compressedSize = compressedBuffer.length;
-      const ratio = originalSize > 0 ? +(compressedSize / originalSize).toFixed(3) : null;
 
       return res.status(200).json({
         ok: true,
@@ -173,21 +160,20 @@ export default async function handler(req, res) {
         bucket,
         original_path: name,
         compressed_path: destPath,
-        original_size_bytes: originalSize,
-        compressed_size_bytes: compressedSize,
-        compression_ratio: ratio,
+        original_size_bytes: originalBuffer.length,
+        compressed_size_bytes: compressedBuffer.length,
+        compression_ratio: +(compressedBuffer.length / originalBuffer.length).toFixed(3),
         deleted_original: deletedOriginal,
         note: 'Compression is currently a placeholder pass-through.',
       });
     }
 
-    // ---------- Manual mode (legacy body) ----------
+    // ---------- Manual mode (UploadButton.js) ----------
     const { supabasePath, fileBase64, writingUploadId } = req.body || {};
     if (!supabasePath && !fileBase64) {
       return res.status(400).json({ error: 'Provide supabasePath or fileBase64' });
     }
 
-    // Get input bytes
     let inputBuf;
     if (supabasePath) {
       const { data, error } = await supabase.storage.from(DEFAULT_BUCKET).download(supabasePath);
@@ -201,9 +187,7 @@ export default async function handler(req, res) {
       }
       inputBuf = Buffer.from(await data.arrayBuffer());
     } else {
-      const raw = fileBase64
-        .replace(/^data:application\/pdf;base64,/, '')
-        .replace(/^data:.*;base64,/, '');
+      const raw = fileBase64.replace(/^data:.*;base64,/, '');
       try {
         inputBuf = Buffer.from(raw, 'base64');
       } catch (e) {
@@ -213,7 +197,6 @@ export default async function handler(req, res) {
 
     const original_size_bytes = inputBuf.length;
 
-    // Skip <= 0.2 MB
     if (original_size_bytes <= MIN_BYTES) {
       return res.status(200).json({
         ok: true,
@@ -224,28 +207,22 @@ export default async function handler(req, res) {
       });
     }
 
-    // Compress (placeholder)
+    // Compress
     const compressedBuf = await compressPdfPlaceholder(inputBuf);
     const compressed_size_bytes = compressedBuf.length;
     const compression_ratio = +(compressed_size_bytes / original_size_bytes).toFixed(3);
 
-    // Keep your legacy naming pattern for manual mode
     const key = `compressed/${Date.now()}-auto.pdf`;
     const { error: uploadErr } = await supabase
       .storage
       .from(DEFAULT_BUCKET)
-      .upload(key, compressedBuf, { contentType: 'application/pdf', upsert: false });
+      .upload(key, compressedBuf, { contentType: 'application/pdf', upsert: true });
 
     if (uploadErr) {
-      return res.status(500).json({
-        error: 'Failed to upload compressed file',
-        details: uploadErr.message,
-        bucket: DEFAULT_BUCKET,
-        path: key,
-      });
+      return res.status(500).json({ error: 'Failed to upload compressed file', details: uploadErr.message, bucket: DEFAULT_BUCKET, path: key });
     }
 
-    // Optional DB update if you pass writingUploadId
+    // Optional DB update
     let writingUploadUpdated = false;
     if (writingUploadId) {
       const { error: dbErr } = await supabase.from('Writing_Uploads').update({
@@ -258,11 +235,7 @@ export default async function handler(req, res) {
         updated_at: new Date().toISOString(),
       }).eq('id', writingUploadId);
 
-      if (dbErr) {
-        console.warn('[compress-and-store] Writing_Uploads update failed:', dbErr.message);
-      } else {
-        writingUploadUpdated = true;
-      }
+      if (!dbErr) writingUploadUpdated = true;
     }
 
     return res.status(200).json({
@@ -276,6 +249,7 @@ export default async function handler(req, res) {
       writingUploadUpdated,
       note: 'Compression is currently a placeholder pass-through.',
     });
+
   } catch (e) {
     console.error('[/api/compress-and-store] Uncaught error', e);
     const status = e?.statusCode || 500;
