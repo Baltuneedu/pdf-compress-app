@@ -1,0 +1,145 @@
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Client-side PDF Compression + Store (v8)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root { color-scheme: light dark; }
+      body { font-family: system-ui, sans-serif; margin: 2rem; }
+      .row { margin: 0.75rem 0; display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+      label { display: inline-flex; gap: 0.5rem; align-items: center; }
+      button { padding: 0.55rem 0.9rem; border-radius: 6px; border: 1px solid #bbb; cursor: pointer; }
+      pre#out { background: #111; color: #eaeaea; padding: 0.9rem; border-radius: 6px; overflow: auto; min-height: 3rem; }
+      .banner { padding: 0.6rem 0.9rem; border-radius: 6px; background: #e6ffed; color: #0b6b2b; border: 1px solid #b7f3c7; }
+      .hint { color: #666; font-size: 0.95rem; }
+    </style>
+  </head>
+
+  <body>
+    <div class="banner">HTML loaded OK (v8)</div>
+
+    <h1>Client-side PDF Compression + Store</h1>
+    <p class="hint">
+      Compress runs entirely in your browser using <code>pdf.js</code> + <code>pdf-lib</code>.
+      Then we <strong>upload the compressed PDF</strong> to your Supabase Storage via <code>/api/store</code>.
+    </p>
+
+    <div class="row">
+      <input id="pdf" type="file" accept="application/pdf" />
+    </div>
+
+    <div class="row">
+      <label>Scale <input id="scale" type="number" step="0.1" value="1.2" /></label>
+      <label>JPEG quality <input id="quality" type="number" step="0.05" value="0.6" min="0.1" max="0.95" /></label>
+      <label>Max pages <input id="maxPages" type="number" value="150" /></label>
+    </div>
+
+    <div class="row">
+      <button id="go">Compress + Upload</button>
+      <button id="download" disabled>Download</button>
+    </div>
+
+    <pre id="out">Loading module…</pre>
+
+    <script type="module">
+      window.addEventListener('DOMContentLoaded', async () => {
+        const $ = (s) => document.querySelector(s);
+        const out = $('#out');
+
+        // Diagnostics: ensure elements exist
+        const ids = ['pdf','scale','quality','maxPages','go','download','out'];
+        const missing = ids.filter(id => !document.getElementById(id));
+        if (missing.length) {
+          out.textContent = 'Missing elements: ' + missing.join(', ');
+          console.error('Missing elements:', missing);
+          return;
+        }
+
+        // Load compressor module with cache buster
+        const moduleUrl = './js/browser-compress.js?v=8';
+        let compressPdfInBrowser, downloadBlob;
+        try {
+          const mod = await import(moduleUrl);
+          ({ compressPdfInBrowser, downloadBlob } = mod);
+          console.log('✔ Module loaded from', moduleUrl);
+          out.textContent = 'Module ready. Choose a PDF and click "Compress + Upload".';
+        } catch (e) {
+          console.error('Module load failed', moduleUrl, e);
+          out.textContent = 'Module load failed: ' + (e?.message || e);
+          return;
+        }
+
+        const goBtn = $('#go');
+        const dlBtn = $('#download');
+        const fileInput = $('#pdf');
+        const scaleInput = $('#scale');
+        const qInput = $('#quality');
+        const maxPagesInput = $('#maxPages');
+
+        let lastBlob = null;
+
+        goBtn.addEventListener('click', async () => {
+          try {
+            const f = fileInput.files?.[0];
+            if (!f) return alert('Choose a PDF first.');
+
+            out.textContent = 'Compressing…';
+            const scale = parseFloat(scaleInput.value);
+            const jpegQuality = parseFloat(qInput.value);
+            const maxPages = parseInt(maxPagesInput.value, 10);
+
+            const { blob, tookMs, pageCount } = await compressPdfInBrowser(f, {
+              scale, jpegQuality, maxPages
+            });
+            lastBlob = blob;
+
+            const origMB = (f.size / (1024*1024)).toFixed(2);
+            const newMB  = (blob.size / (1024*1024)).toFixed(2);
+            const savings = ((1 - blob.size / f.size) * 100).toFixed(1);
+
+            out.textContent =
+              `Compressed locally.\nPages: ${pageCount}\n` +
+              `Original: ${origMB} MB\nCompressed: ${newMB} MB\n` +
+              `Savings: ${savings}%\nTime: ${tookMs} ms\n\nUploading to Supabase…`;
+
+            // Convert to base64 for upload
+            const base64 = await blob.arrayBuffer()
+              .then(buf => btoa(String.fromCharCode(...new Uint8Array(buf))));
+
+            const resp = await fetch('/api/store', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                fileBase64: `data:application/pdf;base64,${base64}`,
+                fileName: f.name.replace(/\.pdf$/i, '') + '.compressed.pdf',
+                writingUploadId: null
+              }),
+            });
+
+            const result = await resp.json();
+            if (!resp.ok) {
+              console.error('Upload failed', result);
+              out.textContent += `\nUpload failed: ${result?.error || resp.statusText}`;
+              alert(`Upload failed: ${result?.error || resp.statusText}`);
+              return;
+            }
+
+            out.textContent += `\nUploaded!\nPath: ${result.compressed_path}\nSize: ${result.compressed_size_bytes} bytes`;
+            dlBtn.disabled = false;
+          } catch (err) {
+            console.error(err);
+            out.textContent = 'Error: ' + (err?.message || err);
+            alert(`Error: ${err?.message || err}`);
+          }
+        });
+
+        dlBtn.addEventListener('click', () => {
+          if (!lastBlob) return;
+          downloadBlob(lastBlob, 'compressed.pdf');
+        });
+      });
+    </script>
+  </body>
+</html>
