@@ -1,4 +1,3 @@
-
 // file: pdf-compress-app/pages/api/compress-and-store.js
 import { createClient } from '@supabase/supabase-js';
 
@@ -6,7 +5,6 @@ const REQUIRED_ENVS = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE'];
 
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || '';
-// Support either SUPABASE_BUCKET or DEFAULT_PDF_BUCKET (use whatever you’ve set in Vercel)
 const DEFAULT_BUCKET =
   process.env.SUPABASE_BUCKET ||
   process.env.DEFAULT_PDF_BUCKET ||
@@ -23,7 +21,7 @@ const RAW_ALLOWED = (process.env.ALLOWED_ORIGINS || '')
 export const config = {
   api: {
     bodyParser: {
-      sizeLimit: '50mb', // Next.js parser limit (Vercel still has its own body-size limits)
+      sizeLimit: '50mb',
     },
   },
 };
@@ -79,12 +77,9 @@ function extractRecordFromWebhook(body) {
 
 // ---- Helper: derive bucket & name from record/file_url/file_path ----
 function deriveBucket(record) {
-  // Prefer explicit bucket_id from the record; else default
   let bucket = record?.bucket_id || DEFAULT_BUCKET;
 
-  // Fallback: parse from file_url
   if (!bucket && typeof record?.file_url === 'string') {
-    // e.g. .../storage/v1/object/public/Teacher%20Writing%20Uploads/<user_id>/file.pdf
     const m = record.file_url.match(/\/object\/(?:public|sign(?:ed)?)\/([^/]+)/);
     if (m && m[1]) bucket = decodeURIComponent(m[1]);
   }
@@ -93,14 +88,12 @@ function deriveBucket(record) {
 }
 
 function deriveObjectName(record, bucket) {
-  // Prefer record.name or record.file_path (e.g. "<uuid>/IMG_7584.pdf")
   let name = record?.name || record?.file_path || null;
 
-  // Fallback: slice path after bucket in file_url
   if (!name && typeof record?.file_url === 'string' && bucket) {
     const idx = record.file_url.indexOf(`/object/`);
     if (idx >= 0) {
-      const after = record.file_url.slice(idx); // "object/public/<bucket>/<path...>"
+      const after = record.file_url.slice(idx);
       const parts = after.split('/');
       const bucketIdx = parts.findIndex(p => decodeURIComponent(p) === bucket);
       if (bucketIdx >= 0 && bucketIdx + 1 < parts.length) {
@@ -115,7 +108,12 @@ function deriveObjectName(record, bucket) {
 
 // ---- Microservice call helper (Ghostscript on Render) ----
 async function compressViaService({ bucket, name }) {
-  const url = `${process.env.PDF_COMPRESSOR_URL}/compress`;
+  // Remove trailing slashes before appending /compress
+  const base = (process.env.PDF_COMPRESSOR_URL || '').replace(/\/+$/, '');
+  const url = `${base}/compress`;
+
+  console.log('[compress-and-store] calling microservice:', url, 'bucket:', bucket, 'name:', name);
+
   const resp = await fetch(url, {
     method: 'POST',
     headers: {
@@ -161,7 +159,6 @@ export default async function handler(req, res) {
       const bucket = deriveBucket(record);
       const name = deriveObjectName(record, bucket);
 
-      // Optional skip by size if present on the record
       const size =
         (typeof record?.metadata?.size === 'number')
           ? record.metadata.size
@@ -197,7 +194,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---------- Manual mode (unchanged for now) ----------
+    // ---------- Manual mode ----------
     const { supabasePath, fileBase64, writingUploadId } = req.body || {};
     if (!supabasePath && !fileBase64) {
       return res.status(400).json({ error: 'Provide supabasePath or fileBase64' });
@@ -236,7 +233,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // (Manual mode still uses local pass-through; you can later switch this to microservice if needed)
+    // (Manual mode currently just passes through)
     const compressedBuf = inputBuf;
     const compressed_size_bytes = compressedBuf.length;
     const compression_ratio = +(compressed_size_bytes / original_size_bytes).toFixed(3);
