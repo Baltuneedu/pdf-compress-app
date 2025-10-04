@@ -23,7 +23,7 @@ const RAW_ALLOWED = (process.env.ALLOWED_ORIGINS || '')
 export const config = {
   api: {
     bodyParser: {
-      sizeLimit: '50mb', // Keep current limit (Next.js parser only)
+      sizeLimit: '50mb', // Next.js parser limit (Vercel still has its own body-size limits)
     },
   },
 };
