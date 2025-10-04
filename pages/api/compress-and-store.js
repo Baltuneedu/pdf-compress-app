@@ -1,15 +1,20 @@
-// file: pdf-compress-app/pages/api/compress-and-store.js
 
+// file: pdf-compress-app/pages/api/compress-and-store.js
 import { createClient } from '@supabase/supabase-js';
 
-const REQUIRED_ENVS = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE', 'SUPABASE_BUCKET'];
+const REQUIRED_ENVS = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE'];
 
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || '';
-const DEFAULT_BUCKET = process.env.SUPABASE_BUCKET || '';
+// Support either SUPABASE_BUCKET or DEFAULT_PDF_BUCKET (use whatever you’ve set in Vercel)
+const DEFAULT_BUCKET =
+  process.env.SUPABASE_BUCKET ||
+  process.env.DEFAULT_PDF_BUCKET ||
+  '';
 
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const DELETE_ORIGINAL_AFTER_COMPRESS = process.env.DELETE_ORIGINAL_AFTER_COMPRESS === '1';
+
 const RAW_ALLOWED = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -18,7 +23,7 @@ const RAW_ALLOWED = (process.env.ALLOWED_ORIGINS || '')
 export const config = {
   api: {
     bodyParser: {
-      sizeLimit: '50mb', // keep current limit
+      sizeLimit: '50mb', // Keep current limit (Next.js parser only)
     },
   },
 };
@@ -64,18 +69,67 @@ function getAdminClientOrThrow() {
   return createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, { auth: { persistSession: false } });
 }
 
-// ---- Placeholder compression (pass-through) ----
-async function compressPdfPlaceholder(buffer) {
-  console.info('[compress-and-store] Using placeholder compression (pass-through).');
-  return buffer;
-}
-
 // ---- Helper: extract record from webhook payload ----
 function extractRecordFromWebhook(body) {
   if (!body) return null;
   if (body.record) return body.record;
   if (body.new) return body.new;
   return null;
+}
+
+// ---- Helper: derive bucket & name from record/file_url/file_path ----
+function deriveBucket(record) {
+  // Prefer explicit bucket_id from the record; else default
+  let bucket = record?.bucket_id || DEFAULT_BUCKET;
+
+  // Fallback: parse from file_url
+  if (!bucket && typeof record?.file_url === 'string') {
+    // e.g. .../storage/v1/object/public/Teacher%20Writing%20Uploads/<user_id>/file.pdf
+    const m = record.file_url.match(/\/object\/(?:public|sign(?:ed)?)\/([^/]+)/);
+    if (m && m[1]) bucket = decodeURIComponent(m[1]);
+  }
+
+  return bucket;
+}
+
+function deriveObjectName(record, bucket) {
+  // Prefer record.name or record.file_path (e.g. "<uuid>/IMG_7584.pdf")
+  let name = record?.name || record?.file_path || null;
+
+  // Fallback: slice path after bucket in file_url
+  if (!name && typeof record?.file_url === 'string' && bucket) {
+    const idx = record.file_url.indexOf(`/object/`);
+    if (idx >= 0) {
+      const after = record.file_url.slice(idx); // "object/public/<bucket>/<path...>"
+      const parts = after.split('/');
+      const bucketIdx = parts.findIndex(p => decodeURIComponent(p) === bucket);
+      if (bucketIdx >= 0 && bucketIdx + 1 < parts.length) {
+        const pathParts = parts.slice(bucketIdx + 1);
+        name = decodeURIComponent(pathParts.join('/'));
+      }
+    }
+  }
+
+  return name;
+}
+
+// ---- Microservice call helper (Ghostscript on Render) ----
+async function compressViaService({ bucket, name }) {
+  const url = `${process.env.PDF_COMPRESSOR_URL}/compress`;
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.PDF_COMPRESSOR_SECRET}`,
+    },
+    body: JSON.stringify({ bucket, name, overwrite: true }),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Compressor failed (${resp.status}): ${text}`);
+  }
+  return resp.json(); // { ok, overwrote, original_bytes, compressed_bytes, ratio, quality }
 }
 
 export default async function handler(req, res) {
@@ -104,71 +158,46 @@ export default async function handler(req, res) {
 
     // ---------- Webhook mode ----------
     if (isWebhook) {
-      const bucket = record.bucket_id || DEFAULT_BUCKET;
-      const name = record.name;
-      const size = (typeof record?.metadata?.size === 'number')
-        ? record.metadata.size
-        : (typeof record?.size === 'number' ? record.size : null);
+      const bucket = deriveBucket(record);
+      const name = deriveObjectName(record, bucket);
+
+      // Optional skip by size if present on the record
+      const size =
+        (typeof record?.metadata?.size === 'number')
+          ? record.metadata.size
+          : (typeof record?.size === 'number' ? record.size : null);
 
       if (!bucket || !name) {
-        return res.status(400).json({ error: 'Missing bucket_id or name in webhook record', record });
+        return res.status(400).json({ error: 'Missing bucket or object path', record });
       }
 
       if (typeof size === 'number' && size <= MIN_BYTES) {
         return res.status(200).json({
           ok: true,
+          mode: 'webhook',
           skipped: true,
           reason: `size <= 200KB (${size} bytes)`,
-          bucket,
-          name,
+          bucket, path: name,
         });
       }
 
-      // Download original
-      const { data: originalFile, error: dlError } = await supabase.storage.from(bucket).download(name);
-      if (dlError) {
-        return res.status(500).json({ error: 'Failed to download original', details: dlError.message, bucket, name });
-      }
-
-      const originalBuffer = Buffer.from(await originalFile.arrayBuffer());
-
-      // Compress (placeholder)
-      const compressedBuffer = await compressPdfPlaceholder(originalBuffer);
-
-      // Upload compressed copy
-      const destPath = `compressed/${name}`;
-      const { error: upErr } = await supabase.storage.from(bucket).upload(destPath, compressedBuffer, {
-        contentType: 'application/pdf',
-        upsert: true,
-        cacheControl: '3600',
-      });
-
-      if (upErr) {
-        return res.status(500).json({ error: 'Failed to upload compressed copy', details: upErr.message, bucket, destPath });
-      }
-
-      // Optionally delete original
-      let deletedOriginal = false;
-      if (DELETE_ORIGINAL_AFTER_COMPRESS) {
-        const { error: rmErr } = await supabase.storage.from(bucket).remove([name]);
-        if (!rmErr) deletedOriginal = true;
-      }
+      // Call microservice to compress & overwrite original
+      const result = await compressViaService({ bucket, name });
 
       return res.status(200).json({
         ok: true,
         mode: 'webhook',
         bucket,
-        original_path: name,
-        compressed_path: destPath,
-        original_size_bytes: originalBuffer.length,
-        compressed_size_bytes: compressedBuffer.length,
-        compression_ratio: +(compressedBuffer.length / originalBuffer.length).toFixed(3),
-        deleted_original: deletedOriginal,
-        note: 'Compression is currently a placeholder pass-through.',
+        path: name,
+        original_size_bytes: result.original_bytes,
+        compressed_size_bytes: result.compressed_bytes,
+        compression_ratio: result.ratio,
+        overwrote: result.overwrote,
+        quality: result.quality,
       });
     }
 
-    // ---------- Manual mode (UploadButton.js) ----------
+    // ---------- Manual mode (unchanged for now) ----------
     const { supabasePath, fileBase64, writingUploadId } = req.body || {};
     if (!supabasePath && !fileBase64) {
       return res.status(400).json({ error: 'Provide supabasePath or fileBase64' });
@@ -207,8 +236,8 @@ export default async function handler(req, res) {
       });
     }
 
-    // Compress
-    const compressedBuf = await compressPdfPlaceholder(inputBuf);
+    // (Manual mode still uses local pass-through; you can later switch this to microservice if needed)
+    const compressedBuf = inputBuf;
     const compressed_size_bytes = compressedBuf.length;
     const compression_ratio = +(compressed_size_bytes / original_size_bytes).toFixed(3);
 
@@ -222,7 +251,6 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'Failed to upload compressed file', details: uploadErr.message, bucket: DEFAULT_BUCKET, path: key });
     }
 
-    // Optional DB update
     let writingUploadUpdated = false;
     if (writingUploadId) {
       const { error: dbErr } = await supabase.from('Writing_Uploads').update({
@@ -247,7 +275,7 @@ export default async function handler(req, res) {
       compressed_size_bytes,
       compression_ratio,
       writingUploadUpdated,
-      note: 'Compression is currently a placeholder pass-through.',
+      note: 'Manual mode currently pass-through; webhook mode uses microservice.',
     });
 
   } catch (e) {
