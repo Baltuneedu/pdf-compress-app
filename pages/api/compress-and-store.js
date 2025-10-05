@@ -69,11 +69,27 @@ export default async function handler(req, res) {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${PDF_COMPRESSOR_SECRET}`,
       },
-      body: JSON.stringify({ bucket, name, overwrite: true }),
+      body: JSON.stringify({ bucket, name }),
       signal: controller.signal,
     }).finally(() => clearTimeout(timeout));
 
     const body = await resp.json().catch(() => ({}));
+
+    // Special case: too large (red cross in UI)
+    if (body?.error === 'too_large') {
+      // optional: store error reason if you add a column
+      // alter table public.pdf_storage add column if not exists processing_error text;
+      await supabase
+        .from('pdf_storage')
+        .update({
+          status: 'error',
+          processing_finished_at: new Date().toISOString(),
+          // processing_error: 'too_large', // uncomment if you add the column
+        })
+        .eq('id', id);
+
+      return res.status(200).json({ ok: false, error: 'too_large', ...body });
+    }
 
     if (!resp.ok || !body.ok) {
       // 3a) Mark error
@@ -84,6 +100,7 @@ export default async function handler(req, res) {
           processing_finished_at: new Date().toISOString(),
         })
         .eq('id', id);
+
       return res
         .status(502)
         .json({ ok: false, error: body.error || `compressor-service HTTP ${resp.status}` });
@@ -118,4 +135,3 @@ export default async function handler(req, res) {
     } catch {}
     return res.status(500).json({ ok: false, error: err.message || String(err) });
   }
-}
