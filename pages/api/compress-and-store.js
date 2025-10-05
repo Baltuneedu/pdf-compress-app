@@ -51,7 +51,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: 'Missing bucket or object path from record' });
     }
 
-    // 1) Mark as pending + start time
+    // 1) Mark as pending + start time (per-file; independent)
     await supabase
       .from('pdf_storage')
       .update({
@@ -62,7 +62,7 @@ export default async function handler(req, res) {
 
     // 2) Call microservice
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120_000); // 120s safety
+    const timeout = setTimeout(() => controller.abort(), 120_000); // 120s safety (you can raise if desired)
     const resp = await fetch(`${PDF_COMPRESSOR_URL}/compress`, {
       method: 'POST',
       headers: {
@@ -77,14 +77,12 @@ export default async function handler(req, res) {
 
     // Special case: too large (red cross in UI)
     if (body?.error === 'too_large') {
-      // optional: store error reason if you add a column
-      // alter table public.pdf_storage add column if not exists processing_error text;
       await supabase
         .from('pdf_storage')
         .update({
           status: 'error',
           processing_finished_at: new Date().toISOString(),
-          // processing_error: 'too_large', // uncomment if you add the column
+          // processing_error: 'too_large', // uncomment and add column if you want
         })
         .eq('id', id);
 
@@ -92,7 +90,7 @@ export default async function handler(req, res) {
     }
 
     if (!resp.ok || !body.ok) {
-      // 3a) Mark error
+      // 3a) Mark error for this file (independent of others)
       await supabase
         .from('pdf_storage')
         .update({
@@ -106,7 +104,7 @@ export default async function handler(req, res) {
         .json({ ok: false, error: body.error || `compressor-service HTTP ${resp.status}` });
     }
 
-    // 3b) Mark done + metrics
+    // 3b) Mark done + metrics (per-file; immediate)
     await supabase
       .from('pdf_storage')
       .update({
@@ -114,12 +112,16 @@ export default async function handler(req, res) {
         processing_finished_at: new Date().toISOString(),
         compressed_size_bytes: body.compressed_bytes ?? null,
         compression_ratio: body.ratio ?? null,
+        // New metrics fields for UI
+        hit_target: body.hit_target ?? null,
+        overwrote: body.overwrote ?? null,
+        pass_used: body.pass_used ?? null,
       })
       .eq('id', id);
 
     return res.status(200).json({ ok: true, ...body });
   } catch (err) {
-    // 4) Ensure error status is recorded
+    // 4) Ensure error status is recorded for this file
     try {
       const payload = req.body || {};
       const record = payload.record || payload.new || payload || {};
@@ -135,3 +137,4 @@ export default async function handler(req, res) {
     } catch {}
     return res.status(500).json({ ok: false, error: err.message || String(err) });
   }
+}
